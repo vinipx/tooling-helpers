@@ -379,6 +379,7 @@ jobs:
         with:
           name: generated-tests
           path: generated-tests/
+```
 
 #### GitLab CI Example
 
