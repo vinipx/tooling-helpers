@@ -1,7 +1,7 @@
 {
   "name": "api-test-gen",
   "version": "1.0.0",
-  "description": "Auto-generate Vitest test scaffolds from OpenAPI 3.x specifications",
+  "description": "Auto-generate Vitest or Jest test scaffolds from OpenAPI 3.x specifications",
   "type": "module",
   "bin": {
     "openapi-test-gen": "./openapi-test-gen.js"
@@ -21,6 +21,7 @@
     "swagger",
     "test-generation",
     "vitest",
+    "jest",
     "cli"
   ],
   "license": "MIT"

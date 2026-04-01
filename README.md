@@ -6,4 +6,4 @@ Developer productivity utilities.
 
 | Tool | Description |
 |------|-------------|
-| [api-test-gen](./api-test-gen/) | Auto-generate Vitest test scaffolds from OpenAPI 3.x specs |
+| [api-test-gen](./api-test-gen/) | Auto-generate Vitest/Jest test scaffolds from OpenAPI 3.x specs |
