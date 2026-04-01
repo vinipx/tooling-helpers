@@ -1,0 +1,27 @@
+{
+  "name": "api-test-gen",
+  "version": "1.0.0",
+  "description": "Auto-generate Vitest test scaffolds from OpenAPI 3.x specifications",
+  "type": "module",
+  "bin": {
+    "openapi-test-gen": "./openapi-test-gen.js"
+  },
+  "scripts": {
+    "start": "node openapi-test-gen.js"
+  },
+  "dependencies": {
+    "@apidevtools/swagger-parser": "^10.1.0",
+    "js-yaml": "^4.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "openapi",
+    "swagger",
+    "test-generation",
+    "vitest",
+    "cli"
+  ],
+  "license": "MIT"
+}
