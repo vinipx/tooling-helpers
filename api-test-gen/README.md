@@ -379,6 +379,40 @@ jobs:
         with:
           name: generated-tests
           path: generated-tests/
+
+#### GitLab CI Example
+
+```yaml
+generate-api-tests:
+  image: node:18
+  rules:
+    - changes:
+        - "**/*.yaml"
+        - "**/*.yml"
+        - "**/*.json"
+  before_script:
+    - git fetch --depth=2   # needed for --check-diff change detection
+    - cd api-test-gen && npm ci
+  script:
+    - bash ci/generate-tests.sh --check-diff
+  variables:
+    SPEC_PATH: ../specs/api.yaml
+    FRAMEWORK: vitest
+    # Set TEST_MODE=all to also generate negative/edge case tests.
+    # With LLM_PROVIDER=rules (default), no extra dependencies or secrets are needed.
+    TEST_MODE: all
+    LLM_PROVIDER: rules
+    # To use OpenAI for richer negative cases, uncomment the lines below
+    # and add OPENAI_API_KEY to your GitLab project's CI/CD variables
+    # (Settings → CI/CD → Variables), marked as "Masked":
+    # LLM_PROVIDER: openai
+    # LLM_MODEL: gpt-4o-mini
+    # OPENAI_API_KEY: $OPENAI_API_KEY
+  artifacts:
+    paths:
+      - generated-tests/
+    expire_in: 7 days
+  working_directory: api-test-gen
 ```
 
 ### Requirements
