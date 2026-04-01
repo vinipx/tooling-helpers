@@ -29,7 +29,29 @@ node openapi-test-gen.js --spec <path|url> [options]
 | `--framework` | Test framework to generate for: `vitest` or `jest` | `vitest` |
 | `--dry-run` | Print generated file contents to stdout without writing to disk | `false` |
 
-### Examples
+### Interactive Mode
+
+Run with no arguments to launch the interactive wizard:
+
+```bash
+node openapi-test-gen.js
+```
+
+The wizard prompts you step-by-step for:
+- Spec source (local file or URL)
+- Test framework (Vitest or Jest)
+- Output directory
+- Base URL override (optional)
+- Auth header (optional)
+- Dry run toggle
+
+You can also explicitly invoke it with:
+
+```bash
+node openapi-test-gen.js --interactive
+```
+
+### Examples (non-interactive)
 
 ```bash
 # Local YAML file
@@ -68,6 +90,69 @@ generated-tests/
 cd generated-tests
 npm install
 npm test
+```
+
+### CI/CD Integration
+
+A shell script is provided at `ci/generate-tests.sh` for pipeline use. It reads configuration from environment variables and optionally skips generation if no spec files changed.
+
+#### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SPEC_PATH` | Path or URL to OpenAPI spec | *(required)* |
+| `OUTPUT_DIR` | Output directory for generated tests | `./generated-tests` |
+| `FRAMEWORK` | `vitest` or `jest` | `vitest` |
+| `BASE_URL` | Override server URL from spec | *(from spec)* |
+| `AUTH_HEADER` | Auth header for all tests | *(none)* |
+| `DRY_RUN` | Set to `"true"` for dry run | `false` |
+| `DIFF_BASE` | Git ref for change detection | `HEAD~1` |
+| `SPEC_GLOB` | Globs for spec file matching | `*.yaml *.yml *.json` |
+
+#### Basic Usage
+
+```bash
+SPEC_PATH=./api.yaml bash ci/generate-tests.sh
+```
+
+#### With Change Detection
+
+```bash
+SPEC_PATH=./api.yaml bash ci/generate-tests.sh --check-diff
+```
+
+When `--check-diff` is passed, the script runs `git diff` against `DIFF_BASE` and exits early (code 0) if no spec files changed — keeping your pipeline fast.
+
+#### GitHub Actions Example
+
+```yaml
+name: Generate API Tests
+on:
+  push:
+    paths: ['**/*.yaml', '**/*.yml', '**/*.json']
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      - run: npm ci
+        working-directory: api-test-gen
+      - name: Generate tests if spec changed
+        working-directory: api-test-gen
+        env:
+          SPEC_PATH: ../specs/api.yaml
+          FRAMEWORK: vitest
+        run: bash ci/generate-tests.sh --check-diff
+      - uses: actions/upload-artifact@v4
+        with:
+          name: generated-tests
+          path: generated-tests/
 ```
 
 ### Requirements

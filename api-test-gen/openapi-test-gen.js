@@ -292,43 +292,22 @@ function generateReadme(fwConfig) {
   ].join('\n');
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// ─── Core Generation ──────────────────────────────────────────────────────────
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
+export async function generate({ spec, output, baseUrl: baseUrlOverride, authHeader, framework, dryRun }) {
+  const outputDir = output || './generated-tests';
+  const fwName = framework || 'vitest';
 
-  if (!args.spec) {
-    console.error('Error: --spec is required. Provide a local file path or SwaggerHub URL.');
-    console.error('');
-    console.error('Usage:');
-    console.error('  openapi-test-gen --spec <path|url> [options]');
-    console.error('');
-    console.error('Options:');
-    console.error('  --spec         Local .json/.yaml path or SwaggerHub URL  (required)');
-    console.error('  --output       Destination directory                      (default: ./generated-tests)');
-    console.error('  --base-url     Override server URL found in spec');
-    console.error('  --auth-header  Header injected into every test            (e.g. "Authorization: Bearer __TOKEN__")');
-    console.error('  --framework    Test framework: vitest or jest              (default: vitest)');
-    console.error('  --dry-run      Print generated files to stdout, no disk writes');
+  if (!FRAMEWORK_CONFIGS[fwName]) {
+    console.error(`Error: unsupported framework '${fwName}'. Choose: ${Object.keys(FRAMEWORK_CONFIGS).join(', ')}`);
     process.exit(1);
   }
-
-  const outputDir = args.output || './generated-tests';
-  const baseUrlOverride = args['base-url'] || null;
-  const authHeader = args['auth-header'] || null;
-  const dryRun = args['dry-run'] === true;
-
-  const framework = args.framework || 'vitest';
-  if (!FRAMEWORK_CONFIGS[framework]) {
-    console.error(`Error: unsupported framework '${framework}'. Choose: ${Object.keys(FRAMEWORK_CONFIGS).join(', ')}`);
-    process.exit(1);
-  }
-  const fwConfig = FRAMEWORK_CONFIGS[framework];
+  const fwConfig = FRAMEWORK_CONFIGS[fwName];
 
   // 1. Load raw spec
   let rawSpec;
   try {
-    rawSpec = await loadRawSpec(args.spec);
+    rawSpec = await loadRawSpec(spec);
   } catch (err) {
     console.error(`Error loading spec: ${err.message}`);
     process.exit(1);
@@ -347,7 +326,7 @@ async function main() {
   let derefSpec;
   try {
     const { default: SwaggerParser } = await import('@apidevtools/swagger-parser');
-    const specSource = args.spec.startsWith('http') ? args.spec : resolve(args.spec);
+    const specSource = spec.startsWith('http') ? spec : resolve(spec);
     derefSpec = await SwaggerParser.dereference(specSource);
   } catch (err) {
     console.error(`Error dereferencing spec: ${err.message}`);
@@ -437,7 +416,7 @@ async function main() {
 
   for (const [tag, endpoints] of Object.entries(tagMap)) {
     const filename = `${sanitizeTagForFilename(tag)}.test.js`;
-    files[filename] = generateTestFile(tag, endpoints, baseUrl, authHeader, fwConfig);
+    files[filename] = generateTestFile(tag, endpoints, baseUrl, authHeader || null, fwConfig);
   }
 
   // 7. Write or dry-run
@@ -477,6 +456,60 @@ async function main() {
     console.log(`\nOutput written to: ${resolve(outputDir)}`);
   }
   console.log('');
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
+function printUsage() {
+  console.error('Usage:');
+  console.error('  openapi-test-gen [--interactive]');
+  console.error('  openapi-test-gen --spec <path|url> [options]');
+  console.error('');
+  console.error('Options:');
+  console.error('  --interactive  Launch interactive wizard (default when no arguments)');
+  console.error('  --spec         Local .json/.yaml path or SwaggerHub URL  (required in non-interactive mode)');
+  console.error('  --output       Destination directory                      (default: ./generated-tests)');
+  console.error('  --base-url     Override server URL found in spec');
+  console.error('  --auth-header  Header injected into every test            (e.g. "Authorization: Bearer __TOKEN__")');
+  console.error('  --framework    Test framework: vitest or jest              (default: vitest)');
+  console.error('  --dry-run      Print generated files to stdout, no disk writes');
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const hasArgs = Object.keys(args).length > 0;
+
+  // Interactive mode: no arguments or explicit --interactive flag
+  if (!hasArgs || args.interactive === true) {
+    try {
+      const { runWizard } = await import('./interactive.js');
+      const wizardArgs = await runWizard();
+      if (!wizardArgs) process.exit(0); // user cancelled
+      return generate(wizardArgs);
+    } catch (err) {
+      if (err.code === 'ERR_MODULE_NOT_FOUND') {
+        console.error('Error: interactive mode requires @inquirer/prompts. Run: npm install');
+        process.exit(1);
+      }
+      throw err;
+    }
+  }
+
+  // Non-interactive mode: --spec is required
+  if (!args.spec) {
+    console.error('Error: --spec is required in non-interactive mode.\n');
+    printUsage();
+    process.exit(1);
+  }
+
+  return generate({
+    spec: args.spec,
+    output: args.output,
+    baseUrl: args['base-url'],
+    authHeader: args['auth-header'],
+    framework: args.framework,
+    dryRun: args['dry-run'] === true,
+  });
 }
 
 main().catch(err => {
