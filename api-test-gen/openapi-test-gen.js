@@ -56,7 +56,7 @@ function sanitizeIdentifier(str) {
   return str.replace(/[^a-zA-Z0-9_$]/g, '_').replace(/^(\d)/, '_$1');
 }
 
-function sanitizeTagForFilename(tag) {
+export function sanitizeTagForFilename(tag) {
   return tag.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'untagged';
 }
 
@@ -312,7 +312,7 @@ function generateReadme(fwConfig) {
 
 // ─── Core Generation ──────────────────────────────────────────────────────────
 
-export async function generate({ spec, output, baseUrl: baseUrlOverride, authHeader, framework, dryRun }) {
+export async function generate({ spec, output, baseUrl: baseUrlOverride, authHeader, framework, dryRun, testMode, llmOptions }) {
   const outputDir = output || './generated-tests';
   const fwName = framework || 'vitest';
 
@@ -321,6 +321,25 @@ export async function generate({ spec, output, baseUrl: baseUrlOverride, authHea
     process.exit(1);
   }
   const fwConfig = FRAMEWORK_CONFIGS[fwName];
+
+  // Normalise test mode
+  const VALID_TEST_MODES = ['happy-only', 'negative-only', 'all'];
+  const resolvedTestMode = testMode || 'happy-only';
+  if (!VALID_TEST_MODES.includes(resolvedTestMode)) {
+    console.error(`Error: unsupported test-mode '${resolvedTestMode}'. Choose: ${VALID_TEST_MODES.join(', ')}`);
+    process.exit(1);
+  }
+  const generateHappy    = resolvedTestMode !== 'negative-only';
+  const generateNegative = resolvedTestMode !== 'happy-only';
+
+  // Normalise LLM options
+  const resolvedLlmOptions = {
+    provider: 'rules',
+    model:    null,
+    url:      null,
+    apiKey:   null,
+    ...llmOptions,
+  };
 
   // 1. Load raw spec
   let rawSpec;
@@ -391,10 +410,14 @@ export async function generate({ spec, output, baseUrl: baseUrlOverride, authHea
 
       // Request body fields
       let bodyFields = [];
+      let bodySchema = null;
       if (op.requestBody) {
         const jsonContent = (op.requestBody.content || {})['application/json'];
-        if (jsonContent && jsonContent.schema && jsonContent.schema.properties) {
-          bodyFields = Object.keys(jsonContent.schema.properties);
+        if (jsonContent && jsonContent.schema) {
+          bodySchema = jsonContent.schema;
+          if (jsonContent.schema.properties) {
+            bodyFields = Object.keys(jsonContent.schema.properties);
+          }
         }
       }
 
@@ -415,27 +438,88 @@ export async function generate({ spec, output, baseUrl: baseUrlOverride, authHea
       }
 
       if (!tagMap[tag]) tagMap[tag] = [];
-      tagMap[tag].push({ name, method, path, pathParams, queryParams, bodyFields, responses, operationId });
+      tagMap[tag].push({
+        name, method, path, pathParams, queryParams, bodyFields, responses, operationId,
+        // Extra fields used by negative case generators
+        bodySchema,
+        security:         op.security || null,
+        summary:          op.summary || null,
+        opDescription:    op.description || null,
+        queryParamSchemas: allParams.filter(p => p.in === 'query').map(p => ({ name: p.name, schema: p.schema || {} })),
+      });
     }
   }
 
   const allEndpoints = Object.values(tagMap).flat();
 
+  // 5b. Build negative cases (if requested)
+  let totalNegativeCases = 0;
+  let negativeSource = resolvedLlmOptions.provider;
+
+  if (generateNegative) {
+    const { buildRuleBasedCases } = await import('./negative-rules.js');
+    const useLLM = resolvedLlmOptions.provider !== 'rules';
+
+    let buildLLMCases = null;
+    if (useLLM) {
+      const llmModule = await import('./llm-test-gen.js');
+      buildLLMCases = llmModule.buildLLMCases;
+    }
+
+    for (const endpoint of allEndpoints) {
+      let cases;
+      if (useLLM) {
+        cases = await buildLLMCases(endpoint, resolvedLlmOptions);
+      } else {
+        cases = buildRuleBasedCases(endpoint, authHeader || null);
+      }
+      endpoint.negativeCases = cases;
+      totalNegativeCases += cases.length;
+      // Track if any fell back from LLM to rules
+      if (useLLM && cases.some(c => c.source === 'rules')) {
+        negativeSource = 'llm+rules(fallback)';
+      }
+    }
+  }
+
   // 6. Generate file contents
   const files = {};
-  files['config.js'] = generateConfigFile(baseUrl);
+  files['config.js']    = generateConfigFile(baseUrl);
   files['endpoints.js'] = generateEndpointsFile(allEndpoints);
-  files['validators.js'] = generateValidatorsFile(allSchemas);
+  files['validators.js']= generateValidatorsFile(allSchemas);
   files['package.json'] = generatePackageJson(fwConfig);
-  files['README.md'] = generateReadme(fwConfig);
+  files['README.md']    = generateReadme(fwConfig);
 
   if (fwConfig.configFile) {
     files[fwConfig.configFile.name] = fwConfig.configFile.content;
   }
 
   for (const [tag, endpoints] of Object.entries(tagMap)) {
-    const filename = `${sanitizeTagForFilename(tag)}.test.js`;
-    files[filename] = generateTestFile(tag, endpoints, authHeader || null, fwConfig);
+    // Happy-path test files
+    if (generateHappy) {
+      const filename = `${sanitizeTagForFilename(tag)}.test.js`;
+      files[filename] = generateTestFile(tag, endpoints, authHeader || null, fwConfig);
+    }
+
+    // Negative/edge case test files
+    if (generateNegative) {
+      const { generateNegativeTestFile } = await import('./negative-test-writer.js');
+      const negFilename = `${sanitizeTagForFilename(tag)}.negative.test.js`;
+      files[negFilename] = generateNegativeTestFile(tag, endpoints, authHeader || null, fwConfig);
+    }
+  }
+
+  // Write .env file if an API key was provided for a remote LLM provider
+  if (generateNegative && resolvedLlmOptions.apiKey) {
+    const envKeyName = resolvedLlmOptions.provider === 'openai'
+      ? 'OPENAI_API_KEY'
+      : 'ANTHROPIC_API_KEY';
+    files['.env'] = [
+      `# Auto-generated by openapi-test-gen — DO NOT COMMIT`,
+      `${envKeyName}=${resolvedLlmOptions.apiKey}`,
+      ``,
+    ].join('\n');
+    files['.gitignore'] = `.env\n`;
   }
 
   // 7. Write or dry-run
@@ -459,17 +543,26 @@ export async function generate({ spec, output, baseUrl: baseUrlOverride, authHea
   const tagNames = Object.keys(tagMap);
   const col1 = Math.max(10, ...tagNames.map(t => t.length)) + 2;
   const col2 = 12;
-  const sep = '─'.repeat(col1 + col2 + 28);
+  const col3 = generateNegative ? 16 : 0;
+  const sep = '─'.repeat(col1 + col2 + col3 + 28);
 
   console.log(`\n${sep}`);
-  console.log(`${'Tag'.padEnd(col1)}${'Endpoints'.padEnd(col2)}File`);
+  const negHeader = generateNegative ? 'Neg. cases'.padEnd(col3) : '';
+  console.log(`${'Tag'.padEnd(col1)}${'Endpoints'.padEnd(col2)}${negHeader}File`);
   console.log(sep);
   for (const [tag, endpoints] of Object.entries(tagMap)) {
-    const file = `${sanitizeTagForFilename(tag)}.test.js`;
-    console.log(`${tag.padEnd(col1)}${String(endpoints.length).padEnd(col2)}${file}`);
+    const file = generateHappy ? `${sanitizeTagForFilename(tag)}.test.js` : '';
+    const negFile = generateNegative ? `  +  ${sanitizeTagForFilename(tag)}.negative.test.js` : '';
+    const negCount = generateNegative
+      ? String(endpoints.reduce((n, e) => n + (e.negativeCases || []).length, 0)).padEnd(col3)
+      : '';
+    console.log(`${tag.padEnd(col1)}${String(endpoints.length).padEnd(col2)}${negCount}${file}${negFile}`);
   }
   console.log(sep);
   console.log(`Total: ${allEndpoints.length} endpoint(s) across ${tagNames.length} tag(s)`);
+  if (generateNegative) {
+    console.log(`Negative cases: ${totalNegativeCases} across ${tagNames.length} tag(s)  [source: ${negativeSource}]`);
+  }
 
   if (!dryRun) {
     console.log(`\nOutput written to: ${resolve(outputDir)}`);
@@ -485,13 +578,18 @@ function printUsage() {
   console.error('  openapi-test-gen --spec <path|url> [options]');
   console.error('');
   console.error('Options:');
-  console.error('  --interactive  Launch interactive wizard (default when no arguments)');
-  console.error('  --spec         Local .json/.yaml path or SwaggerHub URL  (required in non-interactive mode)');
-  console.error('  --output       Destination directory                      (default: ./generated-tests)');
-  console.error('  --base-url     Override server URL found in spec');
-  console.error('  --auth-header  Header injected into every test            (e.g. "Authorization: Bearer __TOKEN__")');
-  console.error('  --framework    Test framework: vitest or jest              (default: vitest)');
-  console.error('  --dry-run      Print generated files to stdout, no disk writes');
+  console.error('  --interactive   Launch interactive wizard (default when no arguments)');
+  console.error('  --spec          Local .json/.yaml path or SwaggerHub URL  (required in non-interactive mode)');
+  console.error('  --output        Destination directory                      (default: ./generated-tests)');
+  console.error('  --base-url      Override server URL found in spec');
+  console.error('  --auth-header   Header injected into every test            (e.g. "Authorization: Bearer __TOKEN__")');
+  console.error('  --framework     Test framework: vitest or jest              (default: vitest)');
+  console.error('  --dry-run       Print generated files to stdout, no disk writes');
+  console.error('  --test-mode     happy-only | negative-only | all           (default: happy-only)');
+  console.error('  --llm-provider  rules | ollama | openai | anthropic        (default: rules)');
+  console.error('  --llm-model     Model name override (provider-specific default used if omitted)');
+  console.error('  --llm-url       Ollama base URL                            (default: http://localhost:11434)');
+  console.error('  --llm-api-key   API key for openai/anthropic (or set OPENAI_API_KEY / ANTHROPIC_API_KEY env var)');
 }
 
 async function main() {
@@ -504,7 +602,10 @@ async function main() {
       const { runWizard } = await import('./interactive.js');
       const wizardArgs = await runWizard();
       if (!wizardArgs) process.exit(0); // user cancelled
-      return generate(wizardArgs);
+      return generate({
+        ...wizardArgs,
+        llmOptions: wizardArgs.llmOptions || { provider: 'rules', model: null, url: null, apiKey: null },
+      });
     } catch (err) {
       if (err.code === 'ERR_MODULE_NOT_FOUND') {
         console.error('Error: interactive mode requires @inquirer/prompts. Run: npm install');
@@ -528,6 +629,13 @@ async function main() {
     authHeader: args['auth-header'],
     framework: args.framework,
     dryRun: args['dry-run'] === true,
+    testMode: args['test-mode'],
+    llmOptions: {
+      provider: args['llm-provider'] || 'rules',
+      model:    args['llm-model']    || null,
+      url:      args['llm-url']      || null,
+      apiKey:   args['llm-api-key']  || null,
+    },
   });
 }
 

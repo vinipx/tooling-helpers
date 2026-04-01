@@ -28,6 +28,11 @@ node openapi-test-gen.js --spec <path|url> [options]
 | `--auth-header` | Auth header injected into every test (e.g. `"Authorization: Bearer __TOKEN__"`) | *(none)* |
 | `--framework` | Test framework to generate for: `vitest` or `jest` | `vitest` |
 | `--dry-run` | Print generated file contents to stdout without writing to disk | `false` |
+| `--test-mode` | `happy-only` \| `negative-only` \| `all` — controls which test files are produced | `happy-only` |
+| `--llm-provider` | `rules` \| `ollama` \| `openai` \| `anthropic` — negative case source | `rules` |
+| `--llm-model` | Model name (provider-specific default used if omitted) | *(provider default)* |
+| `--llm-url` | Ollama base URL | `http://localhost:11434` |
+| `--llm-api-key` | API key for OpenAI/Anthropic (prefer env var — see below) | *(from env)* |
 
 ### Interactive Mode
 
@@ -43,6 +48,9 @@ The wizard prompts you step-by-step for:
 - Output directory
 - Base URL override (optional)
 - Auth header (optional)
+- Test generation mode (happy-only / all / negative-only)
+- Negative case source (static rules or LLM-powered)
+- LLM provider, model, URL, and API key (shown only when LLM is selected)
 - Dry run toggle
 
 You can also explicitly invoke it with:
@@ -68,21 +76,41 @@ node openapi-test-gen.js --spec ./petstore.yaml --framework jest --output ./test
 
 # Preview output without writing
 node openapi-test-gen.js --spec ./petstore.yaml --dry-run
+
+# Happy path + negative/edge cases (static rules — no extra dependencies)
+node openapi-test-gen.js --spec ./petstore.yaml --test-mode all
+
+# Negative cases only, using local Ollama (llama3.2)
+node openapi-test-gen.js --spec ./petstore.yaml \
+  --test-mode negative-only \
+  --llm-provider ollama \
+  --llm-model llama3.2
+
+# Negative cases using OpenAI (API key from env var)
+OPENAI_API_KEY=sk-... node openapi-test-gen.js --spec ./petstore.yaml \
+  --test-mode all \
+  --llm-provider openai \
+  --llm-model gpt-4o-mini
 ```
 
 ### Generated file architecture
 
 ```
 generated-tests/
-  config.js           # Runtime configuration — BASE_URL (env-var overridable)
-  endpoints.js        # Frozen ENDPOINTS map: { method, path } per operation
-  validators.js       # Ajv-compiled validators for every 2xx response schema
-  package.json        # type:module + framework/ajv dev deps + "test" script
-  README.md           # Setup & run instructions
-  jest.config.js      # Only when --framework jest
-  pet.test.js         # One test file per API tag (Vitest or Jest)
+  config.js                  # Runtime configuration — BASE_URL (env-var overridable)
+  endpoints.js               # Frozen ENDPOINTS map: { method, path } per operation
+  validators.js              # Ajv-compiled validators for every 2xx response schema
+  package.json               # type:module + framework/ajv dev deps + "test" script
+  README.md                  # Setup & run instructions
+  jest.config.js             # Only when --framework jest
+  pet.test.js                # Happy-path tests, one file per API tag
+  pet.negative.test.js       # Negative/edge case tests (only with --test-mode all|negative-only)
   store.test.js
+  store.negative.test.js
   user.test.js
+  user.negative.test.js
+  .env                       # Only when an API key is entered in the wizard (gitignored)
+  .gitignore                 # Created automatically when .env is written
   ...
 ```
 
@@ -95,7 +123,8 @@ Each generated file has a single, well-defined responsibility so teams can under
 | `config.js` | Runtime environment — `BASE_URL` | Target environment changes |
 | `endpoints.js` | API shape — `{ method, path }` per operation | Spec paths/methods change |
 | `validators.js` | Response contracts — Ajv-compiled 2xx schemas | Response schemas change |
-| `*.test.js` | Test behaviour — one `describe` block per operation | Spec operations change |
+| `*.test.js` | Happy-path tests — one `describe` block per operation | Spec operations change |
+| `*.negative.test.js` | Negative/edge case tests — up to 5 cases per operation | Spec operations change, or re-run with different `--llm-provider` |
 
 #### config.js — runtime-overridable base URL
 
@@ -160,6 +189,118 @@ npm install
 npm test
 ```
 
+---
+
+### Test Modes
+
+The `--test-mode` flag (or the interactive wizard) controls which files are produced:
+
+| Mode | Files produced | When to use |
+|---|---|---|
+| `happy-only` | `*.test.js` only | Default — fast scaffolding, current behaviour |
+| `all` | `*.test.js` + `*.negative.test.js` | Full coverage: happy path and negative/edge cases |
+| `negative-only` | `*.negative.test.js` only | When happy-path files already exist and you only want to add edge cases |
+
+Each `*.negative.test.js` file contains up to **5 test cases per endpoint**, co-located alongside the happy-path file in the same output directory. Each case is annotated with `// [source: rules]` or `// [source: llm]` so you know where it came from.
+
+---
+
+### Negative Case Generation
+
+Two strategies are available, selected via `--llm-provider`:
+
+#### Option 1 — Static Rules (`--llm-provider rules`, default)
+
+Derives negative cases deterministically from the spec schema. No external dependencies, no network calls, works offline.
+
+Rules applied (first 5 matching rules win per endpoint):
+
+| Rule | Trigger | Generated test |
+|---|---|---|
+| Missing auth | Op declares `security` or `--auth-header` was set | Sends request without auth header; expects 401/403 |
+| Missing required field | `requestBody.required[]` has entries | Omits each required field one-by-one; expects 4xx |
+| Invalid format | Property has `format: email\|uuid\|date\|uri` | Sends malformed value; expects 4xx |
+| Boundary violation | Property has `minimum`/`maximum`/`minLength`/`maxLength` | Sends value just outside boundary; expects 4xx |
+| Invalid enum | Property has `enum` | Sends `__INVALID_ENUM_VALUE__`; expects 4xx |
+| Non-existent resource | Endpoint has path params | Uses `NONEXISTENT_99999999` as path param; expects 404 |
+| Invalid Content-Type | POST/PUT/PATCH with request body | Sends `Content-Type: text/plain`; expects 4xx/415 |
+
+#### Option 2 — LLM-powered (`--llm-provider ollama|openai|anthropic`)
+
+Uses a LangChain pipeline to generate contextually-aware negative cases. The LLM receives a structured JSON summary of the endpoint (method, path, schema, response codes, security) and returns up to 5 test case descriptors validated against a Zod schema.
+
+**On failure:** if an LLM call fails for any endpoint (network error, bad JSON, timeout), a warning is printed and the static rule engine is used as fallback for that endpoint. The output file still gets generated.
+
+**Install LLM dependencies** (only needed for LLM mode):
+
+```bash
+# Minimal — just the provider you plan to use:
+npm install @langchain/core @langchain/ollama zod        # Ollama (local)
+npm install @langchain/core @langchain/openai zod        # OpenAI
+npm install @langchain/core @langchain/anthropic zod     # Anthropic
+
+# Or install all at once:
+npm install --include=optional
+```
+
+---
+
+### LLM Provider Setup
+
+#### Ollama (local — recommended)
+
+No API key required. Runs entirely on your machine.
+
+```bash
+# Install Ollama (macOS)
+brew install ollama
+
+# Pull a model (3B is fast; use 8B+ for better reasoning)
+ollama pull llama3.2
+
+# Start the Ollama server (runs in background)
+ollama serve
+```
+
+Then use:
+```bash
+node openapi-test-gen.js --spec ./api.yaml \
+  --test-mode all \
+  --llm-provider ollama \
+  --llm-model llama3.2 \
+  --llm-url http://localhost:11434
+```
+
+#### OpenAI
+
+Set your API key as an environment variable:
+
+```bash
+export OPENAI_API_KEY=sk-...
+node openapi-test-gen.js --spec ./api.yaml \
+  --test-mode all \
+  --llm-provider openai \
+  --llm-model gpt-4o-mini
+```
+
+Or enter the key in the interactive wizard — it will be saved to `<output>/.env` and excluded from git automatically via `.gitignore`.
+
+**Recommended models:** `gpt-4o-mini` (fast, cheap), `gpt-4o` (higher quality)
+
+#### Anthropic
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+node openapi-test-gen.js --spec ./api.yaml \
+  --test-mode all \
+  --llm-provider anthropic \
+  --llm-model claude-haiku-4-5
+```
+
+**Recommended models:** `claude-haiku-4-5` (fast), `claude-sonnet-4-5` (higher quality)
+
+---
+
 ### CI/CD Integration
 
 A shell script is provided at `ci/generate-tests.sh` for pipeline use. It reads configuration from environment variables and optionally skips generation if no spec files changed.
@@ -176,6 +317,14 @@ A shell script is provided at `ci/generate-tests.sh` for pipeline use. It reads 
 | `DRY_RUN` | Set to `"true"` for dry run | `false` |
 | `DIFF_BASE` | Git ref for change detection | `HEAD~1` |
 | `SPEC_GLOB` | Globs for spec file matching | `*.yaml *.yml *.json` |
+| `TEST_MODE` | `happy-only` \| `negative-only` \| `all` | `happy-only` |
+| `LLM_PROVIDER` | `rules` \| `ollama` \| `openai` \| `anthropic` | `rules` |
+| `LLM_MODEL` | Model name override | *(provider default)* |
+| `LLM_URL` | Ollama base URL | `http://localhost:11434` |
+| `OPENAI_API_KEY` | OpenAI API key — store in CI secrets vault | *(from env)* |
+| `ANTHROPIC_API_KEY` | Anthropic API key — store in CI secrets vault | *(from env)* |
+
+> **Security note:** `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` are read directly from the environment inside the tool. They are never passed as CLI arguments to avoid appearing in shell history or process listings.
 
 #### Basic Usage
 
@@ -216,6 +365,15 @@ jobs:
         env:
           SPEC_PATH: ../specs/api.yaml
           FRAMEWORK: vitest
+          # Set TEST_MODE=all to also generate negative/edge case tests.
+          # With LLM_PROVIDER=rules (default), no extra dependencies or secrets are needed.
+          TEST_MODE: all
+          LLM_PROVIDER: rules
+          # To use OpenAI for richer negative cases, uncomment the lines below
+          # and add OPENAI_API_KEY to your repository secrets:
+          # LLM_PROVIDER: openai
+          # LLM_MODEL: gpt-4o-mini
+          # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: bash ci/generate-tests.sh --check-diff
       - uses: actions/upload-artifact@v4
         with:
